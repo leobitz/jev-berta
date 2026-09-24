@@ -148,6 +148,7 @@ The package exposes two main inference calls:
 
 | Dataset | JevBerta | OpenJev | kev-0.8b | laya |
 | --- | ---: | ---: | ---: | ---: |
+| model size | 198M  | 435M | 435M | 435M |
 | validation | 0.854 | 0.556 | 0.713 | 0.503 |
 | ood_eval | 0.627 | 0.391 | 0.640 | 0.431 |
 | truthfulqa | 0.480 | 0.252 | 0.481 | 0.132 |
