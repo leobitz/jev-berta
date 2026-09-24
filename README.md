@@ -2,8 +2,6 @@
 
 JevBerta is a small Python package for running a variable-choice zero-shot classifier over structured decision tasks.
 
-The model is published at `leobitz/jev-berta-base-zeroshot-classifier`. In the earlier evaluation notebooks and result exports, the same model appears under the checkpoint name `best_ood`. In this README, `best_ood` is referred to by its product name: JevBerta.
-
 ## What It Does
 
 JevBerta scores a set of candidate answers conditioned on:
@@ -23,7 +21,7 @@ All supported question types are reduced to classification over the provided cri
 ## Install
 
 ```bash
-pip install -e .
+pip install git+https://github.com/leobitz/jev-berta.git
 ```
 
 ## Quick Start
@@ -146,73 +144,15 @@ The package exposes two main inference calls:
 - converts `criteria` into the candidate list
 - returns one prediction block per question key
 
-## Package Layout
-
-```text
-jev-berta/
-  pyproject.toml
-  README.md
-  src/jev_berta/
-    __init__.py
-    jevberta.py
-  demo/
-    demo_usage.ipynb
-```
-
-## Performance
-
-The metrics below are taken from `combined_results.csv` at the workspace root.
-
-Important caveat:
-
-- JevBerta and OpenJev were often evaluated on the same filtered subsets.
-- `kev-latest` and `laya-typed-decisions` sometimes used much larger sample counts.
-- Because of that, the table is useful for orientation, but not every row is a perfectly controlled apples-to-apples comparison.
-
 ### Accuracy Snapshot
 
-| Dataset | JevBerta | OpenJev | kev-latest | laya-typed-decisions |
+| Dataset | JevBerta | OpenJev | kev-0.8b | laya |
 | --- | ---: | ---: | ---: | ---: |
 | validation | 0.854 | 0.556 | 0.713 | 0.503 |
 | ood_eval | 0.627 | 0.391 | 0.640 | 0.431 |
 | truthfulqa | 0.480 | 0.252 | 0.481 | 0.132 |
 | mmlu | 0.276 | 0.327 | 0.458 | 0.274 |
 | type_decision | 0.374 | 0.390 | 0.501 | 0.332 |
-
-### JevBerta Detailed Metrics
-
-| Dataset | Examples | Accuracy | Top-2 Acc | NLL | Brier | ECE | Mean Confidence |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| validation | 998 | 0.854 | 0.948 | 0.372 | 0.187 | 0.025 | 0.851 |
-| ood_eval | 976 | 0.627 | 0.831 | 1.198 | 0.523 | 0.124 | 0.745 |
-| truthfulqa | 817 | 0.480 | 0.690 | 1.386 | 0.669 | 0.086 | 0.561 |
-| mmlu | 983 | 0.276 | 0.532 | 1.408 | 0.759 | 0.070 | 0.345 |
-| type_decision | not recorded | 0.374 | not recorded | not recorded | not recorded | not recorded | not recorded |
-
-### Reading The Results
-
-A few clear patterns show up in the current benchmark export.
-
-- JevBerta is strongest on the builder-style validation set, where it posts the best accuracy in the file at `0.854` and also the best calibration there with `ECE = 0.025`.
-- On `ood_eval`, JevBerta remains competitive at `0.627` accuracy, trailing `kev-latest` slightly at `0.640` while staying well ahead of OpenJev and Laya on the recorded runs.
-- On `truthfulqa`, JevBerta is materially better than OpenJev and Laya, and effectively tied with `kev-latest` on accuracy.
-- On `mmlu`, JevBerta is weaker. That benchmark looks more like broad factual multiple-choice knowledge than the decision-routing tasks the model is best at.
-- On the custom `type_decision` evaluation row, the exported file records only accuracy. There JevBerta is below OpenJev and `kev-latest`, so that slice is currently a weaker point.
-
-### Summary
-
-Based on the recorded results, JevBerta is best viewed as a strong task-specific decision model rather than a general-purpose knowledge QA model.
-
-It performs best when:
-
-- the task is naturally framed as choosing among candidate actions, labels, or intents
-- the context and query are closely tied to operational decision making
-- calibration matters as much as top-1 accuracy
-
-It performs less strongly when:
-
-- the benchmark tests broad factual world knowledge, such as MMLU
-- the target task differs from the training/evaluation style used in the builder pipeline
 
 ## Demo Notebook
 
