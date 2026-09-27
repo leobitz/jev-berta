@@ -109,23 +109,50 @@ class DirectVariableChoiceClassifier(nn.Module):
             nn.Linear(hidden_size // 2, 1),
         )
 
-    def forward(
+    def encode(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        batch_index: torch.Tensor,
-        choice_index: torch.Tensor,
-        candidate_mask: torch.Tensor,
         token_type_ids: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
+        chunk_size: int | None = None,
+    ) -> torch.Tensor:
+        total = input_ids.shape[0]
+        if chunk_size is None or chunk_size <= 0 or chunk_size >= total:
+            return self._encode_chunk(input_ids, attention_mask, token_type_ids)
+
+        cls_chunks = []
+        for start in range(0, total, chunk_size):
+            end = start + chunk_size
+            cls_chunks.append(
+                self._encode_chunk(
+                    input_ids[start:end],
+                    attention_mask[start:end],
+                    None if token_type_ids is None else token_type_ids[start:end],
+                )
+            )
+        return torch.cat(cls_chunks, dim=0)
+
+    def _encode_chunk(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
         encoder_kwargs: dict[str, torch.Tensor] = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
         }
         if token_type_ids is not None and self.accepts_token_type_ids:
             encoder_kwargs["token_type_ids"] = token_type_ids
+        return self.bert(**encoder_kwargs).last_hidden_state[:, 0]
 
-        cls_states = self.bert(**encoder_kwargs).last_hidden_state[:, 0]
+    def score(
+        self,
+        cls_states: torch.Tensor,
+        batch_index: torch.Tensor,
+        choice_index: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ) -> torch.Tensor:
         batch_size, num_choices = candidate_mask.shape
         hidden_size = cls_states.shape[-1]
         candidate_states = cls_states.new_zeros(batch_size, num_choices, hidden_size)
@@ -137,9 +164,21 @@ class DirectVariableChoiceClassifier(nn.Module):
             hidden = block(hidden, candidate_mask)
 
         logits = self.scorer(hidden).squeeze(-1)
-        logits = logits.masked_fill(~candidate_mask, -1e9)
-        probabilities = F.softmax(logits, dim=-1)
-        return {"logits": logits, "probabilities": probabilities}
+        return logits.masked_fill(~candidate_mask, -1e9)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        batch_index: torch.Tensor,
+        choice_index: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        token_type_ids: torch.Tensor | None = None,
+        encode_chunk_size: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        cls_states = self.encode(input_ids, attention_mask, token_type_ids, encode_chunk_size)
+        logits = self.score(cls_states, batch_index, choice_index, candidate_mask)
+        return {"logits": logits}
 
 
 @dataclass(frozen=True)
@@ -155,6 +194,7 @@ class JevBerta:
         *,
         device: str | torch.device | None = None,
         temperature: float = 1.0,
+        batch_size: int = 8,
         max_length: int | None = None,
         cache_dir: str | Path | None = None,
         local_files_only: bool = False,
@@ -162,6 +202,7 @@ class JevBerta:
     ):
         self.device = _as_device(device)
         self.temperature = float(temperature)
+        self.batch_size = max(1, int(batch_size))
         self.checkpoint_dir = _resolve_checkpoint_dir(
             model_source,
             cache_dir=cache_dir,
@@ -196,59 +237,98 @@ class JevBerta:
     def from_pretrained(cls, model_source: str | Path | None = None, **kwargs: Any) -> "JevBerta":
         return cls(model_source=model_source, **kwargs)
 
-    def _prepare_inputs(self, context: str, query: str, choices: Sequence[str]) -> dict[str, torch.Tensor]:
-        normalized_context = "" if context is None else str(context)
-        normalized_query = "" if query is None else str(query)
-        normalized_choices = [str(choice) for choice in choices]
-        if len(normalized_choices) < 2:
-            raise ValueError("At least two choices are required.")
+    def _prepare_batch(
+        self, items: Sequence[tuple[str, str, Sequence[str]]]
+    ) -> tuple[dict[str, list[list[int]]], torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
+        text_a: list[str] = []
+        text_b: list[str] = []
+        batch_index_list: list[int] = []
+        choice_index_list: list[int] = []
+        num_choices: list[int] = []
+        for item_index, (context, query, choices) in enumerate(items):
+            normalized_context = "" if context is None else str(context)
+            normalized_query = "" if query is None else str(query)
+            normalized_choices = [str(choice) for choice in choices]
+            if len(normalized_choices) < 2:
+                raise ValueError("At least two choices are required.")
 
-        prefix = (
-            f"Context: {normalized_context}\nQuery: {normalized_query}"
-            if normalized_context.strip()
-            else f"Query: {normalized_query}"
-        )
-        tokenized = self.tokenizer(
-            [prefix] * len(normalized_choices),
-            [f"Candidate: {choice}" for choice in normalized_choices],
-            padding=True,
-            truncation="only_first",
+            prefix = (
+                f"Context: {normalized_context}\nQuery: {normalized_query}"
+                if normalized_context.strip()
+                else f"Query: {normalized_query}"
+            )
+            for choice_pos, choice in enumerate(normalized_choices):
+                text_a.append(prefix)
+                text_b.append(f"Candidate: {choice}")
+                batch_index_list.append(item_index)
+                choice_index_list.append(choice_pos)
+            num_choices.append(len(normalized_choices))
+
+        encoded = self.tokenizer(
+            text_a,
+            text_b,
+            padding=False,
+            truncation=True,
             max_length=self.max_length,
-            return_tensors="pt",
         )
-        batch = {
-            **tokenized,
-            "batch_index": torch.zeros(len(normalized_choices), dtype=torch.long),
-            "choice_index": torch.arange(len(normalized_choices), dtype=torch.long),
-            "candidate_mask": torch.ones(1, len(normalized_choices), dtype=torch.bool),
-        }
-        return {key: value.to(self.device) if torch.is_tensor(value) else value for key, value in batch.items()}
+        max_choices = max(num_choices)
+        candidate_mask = torch.zeros(len(num_choices), max_choices, dtype=torch.bool)
+        for item_index, count in enumerate(num_choices):
+            candidate_mask[item_index, :count] = True
 
-    @torch.no_grad()
-    def predict(self, context: str, query: str, choices: Sequence[str]) -> dict[str, Any]:
-        normalized_choices = [str(choice) for choice in choices]
-        batch = self._prepare_inputs(context=context, query=query, choices=normalized_choices)
-        outputs = self.model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            token_type_ids=batch.get("token_type_ids"),
-            batch_index=batch["batch_index"],
-            choice_index=batch["choice_index"],
-            candidate_mask=batch["candidate_mask"],
-        )
-        logits = outputs["logits"][0] / self.temperature
-        probabilities = F.softmax(logits, dim=-1).detach().cpu().tolist()
-        best_index = int(torch.argmax(logits).item())
+        batch_index = torch.tensor(batch_index_list, dtype=torch.long, device=self.device)
+        choice_index = torch.tensor(choice_index_list, dtype=torch.long, device=self.device)
+        return dict(encoded), batch_index, choice_index, candidate_mask.to(self.device), num_choices
+
+    @torch.inference_mode()
+    def _score_items(
+        self, items: Sequence[tuple[str, str, Sequence[str]]]
+    ) -> list[torch.Tensor]:
+        encoded, batch_index, choice_index, candidate_mask, num_choices = self._prepare_batch(items)
+        cls_states = self._encode_rows(encoded)
+        logits = self.model.score(cls_states, batch_index, choice_index, candidate_mask)
+        return [logits[item_index, :count] for item_index, count in enumerate(num_choices)]
+
+    def _encode_rows(self, encoded: Mapping[str, list[list[int]]]) -> torch.Tensor:
+        input_ids = encoded["input_ids"]
+        total = len(input_ids)
+        # Group rows of similar length so each chunk pads only to its own longest row.
+        order = sorted(range(total), key=lambda row: len(input_ids[row]))
+        hidden_size = self.model.bert.config.hidden_size
+        param_dtype = next(self.model.parameters()).dtype
+        cls_states = torch.empty(total, hidden_size, device=self.device, dtype=param_dtype)
+        for start in range(0, total, self.batch_size):
+            rows = order[start : start + self.batch_size]
+            chunk = {key: [values[row] for row in rows] for key, values in encoded.items()}
+            padded = self.tokenizer.pad(chunk, padding='longest', return_tensors="pt")
+            token_type_ids = padded.get("token_type_ids")
+            cls_chunk = self.model.encode(
+                padded["input_ids"].to(self.device),
+                padded["attention_mask"].to(self.device),
+                None if token_type_ids is None else token_type_ids.to(self.device),
+            )
+            cls_states[torch.tensor(rows, device=self.device)] = cls_chunk
+        return cls_states
+
+    def _decode_logits(self, choices: Sequence[str], logits_row: torch.Tensor) -> dict[str, Any]:
+        logits_row = logits_row / self.temperature
+        probabilities = F.softmax(logits_row, dim=-1).detach().cpu().tolist()
+        best_index = int(torch.argmax(logits_row).item())
         probability_map = {
-            choice: float(probability) for choice, probability in zip(normalized_choices, probabilities)
+            choice: float(probability) for choice, probability in zip(choices, probabilities)
         }
         return {
-            "choice": normalized_choices[best_index],
+            "choice": choices[best_index],
             "choice_index": best_index,
-            "choices": normalized_choices,
+            "choices": list(choices),
             "probabilities": probability_map,
             "scores": dict(probability_map),
         }
+
+    def predict(self, context: str, query: str, choices: Sequence[str]) -> dict[str, Any]:
+        normalized_choices = [str(choice) for choice in choices]
+        logits_row = self._score_items([(context, query, normalized_choices)])[0]
+        return self._decode_logits(normalized_choices, logits_row)
 
     def _normalize_question_criteria(self, criteria: Any) -> list[CandidateEncoding]:
         if isinstance(criteria, Mapping):
@@ -267,22 +347,26 @@ class JevBerta:
         if not isinstance(questions, Mapping) or not questions:
             raise ValueError("Payload must contain a non-empty 'questions' mapping.")
 
-        predictions: dict[str, Any] = {}
+        question_specs: list[tuple[str, Mapping[str, Any], str, list[CandidateEncoding]]] = []
+        batch_items: list[tuple[str, str, list[str]]] = []
         for question_name, spec in questions.items():
             if not isinstance(spec, Mapping):
                 raise TypeError(f"Question '{question_name}' must be a mapping.")
             query = str(spec.get("instructions", ""))
             encodings = self._normalize_question_criteria(spec.get("criteria"))
-            raw_prediction = self.predict(
-                context=state,
-                query=query,
-                choices=[encoding.rendered_choice for encoding in encodings],
-            )
+            question_specs.append((str(question_name), spec, query, encodings))
+            batch_items.append((state, query, [encoding.rendered_choice for encoding in encodings]))
 
+        logits_rows = self._score_items(batch_items)
+
+        predictions: dict[str, Any] = {}
+        for (question_name, spec, query, encodings), logits_row in zip(question_specs, logits_rows):
+            rendered_choices = [encoding.rendered_choice for encoding in encodings]
+            raw_prediction = self._decode_logits(rendered_choices, logits_row)
             key_by_rendered_choice = {
                 encoding.rendered_choice: encoding.key for encoding in encodings
             }
-            predictions[str(question_name)] = {
+            predictions[question_name] = {
                 "type": spec.get("type"),
                 "query": query,
                 "choice": key_by_rendered_choice[raw_prediction["choice"]],
@@ -295,7 +379,7 @@ class JevBerta:
                     key_by_rendered_choice[rendered_choice]: score
                     for rendered_choice, score in raw_prediction["scores"].items()
                 },
-                "rendered_choices": [encoding.rendered_choice for encoding in encodings],
+                "rendered_choices": rendered_choices,
             }
 
         return {"state": state, "predictions": predictions}
