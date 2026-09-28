@@ -24,6 +24,58 @@ def _as_device(device: str | torch.device | None) -> torch.device:
     return torch.device(device)
 
 
+_DTYPE_ALIASES: dict[str, torch.dtype] = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "half": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+}
+
+
+def _as_dtype(dtype: str | torch.dtype | None, *, device: torch.device) -> torch.dtype:
+    if dtype is None:
+        resolved = torch.float32
+    elif isinstance(dtype, torch.dtype):
+        resolved = dtype
+    else:
+        key = str(dtype).lower()
+        if key not in _DTYPE_ALIASES:
+            raise ValueError(
+                f"Unknown dtype '{dtype}'. Expected one of {sorted(_DTYPE_ALIASES)} or a torch.dtype."
+            )
+        resolved = _DTYPE_ALIASES[key]
+
+    if resolved is torch.float16 and device.type == "cpu":
+        import warnings
+
+        warnings.warn(
+            "float16 was requested on CPU, where it is unreliable and often slower "
+            "than float32. Falling back to float32. Pass device='cuda' to use fp16, "
+            "or dtype='bfloat16' if you need reduced precision on CPU.",
+            stacklevel=2,
+        )
+        resolved = torch.float32
+
+    return resolved
+
+
+def _assert_uniform_dtype(model: nn.Module, *, expected: torch.dtype) -> None:
+    offenders = sorted(
+        {f"{name} ({param.dtype})" for name, param in model.named_parameters() if param.dtype != expected}
+    )
+    if offenders:
+        raise RuntimeError(
+            "JevBerta expected every parameter to be loaded in "
+            f"{expected}, but found mismatched parameters: {', '.join(offenders[:10])}"
+            + (f" (+{len(offenders) - 10} more)" if len(offenders) > 10 else "")
+            + ". This usually means a newer `transformers`/`torch` release changed how "
+            "checkpoint dtype is inferred. Pass an explicit dtype= to JevBerta(...) as a workaround."
+        )
+
+
 def _resolve_checkpoint_dir(
     model_source: str | Path | None,
     *,
@@ -92,9 +144,10 @@ class DirectVariableChoiceClassifier(nn.Module):
         set_heads: int,
         ff_mult: int,
         dropout: float,
+        dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
-        self.bert = AutoModel.from_pretrained(model_name)
+        self.bert = AutoModel.from_pretrained(model_name, torch_dtype=dtype)
         self.accepts_token_type_ids = "token_type_ids" in inspect.signature(self.bert.forward).parameters
         hidden_size = self.bert.config.hidden_size
         self.pre_set_norm = nn.LayerNorm(hidden_size)
@@ -193,6 +246,7 @@ class JevBerta:
         model_source: str | Path | None = None,
         *,
         device: str | torch.device | None = None,
+        dtype: str | torch.dtype | None = None,
         temperature: float = 1.0,
         batch_size: int = 8,
         max_length: int | None = None,
@@ -201,6 +255,7 @@ class JevBerta:
         token: str | None = None,
     ):
         self.device = _as_device(device)
+        self.dtype = _as_dtype(dtype, device=self.device)
         self.temperature = float(temperature)
         self.batch_size = max(1, int(batch_size))
         self.checkpoint_dir = _resolve_checkpoint_dir(
@@ -223,7 +278,9 @@ class JevBerta:
             set_heads=int(self.config.get("set_heads", 8)),
             ff_mult=int(self.config.get("set_ff_mult", 2)),
             dropout=float(self.config.get("dropout", 0.1)),
-        ).to(self.device)
+            dtype=self.dtype,
+        )
+        self.model = self.model.to(device=self.device, dtype=self.dtype)
 
         state_path = self.checkpoint_dir / "model.pt"
         if not state_path.exists():
@@ -231,7 +288,10 @@ class JevBerta:
         state = torch.load(state_path, map_location="cpu")
         state_dict = state["state_dict"] if isinstance(state, dict) and "state_dict" in state else state
         self.model.load_state_dict(state_dict, strict=True)
+        self.model = self.model.to(device=self.device, dtype=self.dtype)
         self.model.eval()
+
+        _assert_uniform_dtype(self.model, expected=self.dtype)
 
     @classmethod
     def from_pretrained(cls, model_source: str | Path | None = None, **kwargs: Any) -> "JevBerta":
@@ -314,14 +374,27 @@ class JevBerta:
         logits_row = logits_row / self.temperature
         probabilities = F.softmax(logits_row, dim=-1).detach().cpu().tolist()
         best_index = int(torch.argmax(logits_row).item())
-        probability_map = {
-            choice: float(probability) for choice, probability in zip(choices, probabilities)
-        }
+
+        if len(set(choices)) != len(choices):
+            import warnings
+
+            warnings.warn(
+                "Duplicate choice strings were passed to predict(); the "
+                "'probabilities'/'scores' dicts sum duplicate entries together "
+                "under one key. Use the returned 'probabilities_by_index' list "
+                "(aligned with 'choices') if you need each entry separately.",
+                stacklevel=3,
+            )
+
+        probability_map: dict[str, float] = {}
+        for choice, probability in zip(choices, probabilities):
+            probability_map[choice] = probability_map.get(choice, 0.0) + float(probability)
         return {
             "choice": choices[best_index],
             "choice_index": best_index,
             "choices": list(choices),
             "probabilities": probability_map,
+            "probabilities_by_index": [float(p) for p in probabilities],
             "scores": dict(probability_map),
         }
 
