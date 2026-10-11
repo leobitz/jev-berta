@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "jev-berta"
 version = "0.1.0"
-description = "Importable inference wrapper for the JevBerta zero-shot classifier"
+description = "Importable inference wrappers for the JevBerta zero-shot classifier and Qwen-based JEV decision models"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -13,8 +13,9 @@ authors = [
 ]
 dependencies = [
   "huggingface-hub>=0.24",
+  "numpy",
   "torch>=2.2",
-  "transformers>=4.45",
+  "transformers>=4.57,<5",
 ]
 keywords = ["classification", "huggingface", "inference", "zero-shot"]
 classifiers = [

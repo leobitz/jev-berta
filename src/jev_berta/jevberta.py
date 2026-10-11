@@ -51,6 +51,8 @@ def _resolve_checkpoint_dir(
             "special_tokens_map.json",
             "spm.model",
             "added_tokens.json",
+            "vocab.json",
+            "merges.txt",
         ],
     )
     return Path(snapshot_path)

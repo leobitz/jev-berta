@@ -84,6 +84,48 @@ result = model.predict_jev(payload)
 print(result["predictions"])
 ```
 
+## Qwen Decision Models (`JevDecider`)
+
+`JevDecider` loads the Qwen-based decision checkpoints written by the JEV-Bench `train.py`
+(`hierarchical` or `bev` architecture; the config's `architecture` field selects the model). The source
+can be a Hugging Face repo id, a checkpoint directory, or a training output directory containing `best_val`.
+
+```python
+from jev_berta import JevDecider
+
+decider = JevDecider.from_pretrained("leobitz/decision-master-base-label-encode-0.1", batch_size=32)
+
+decider.choice("Card charged twice.", "Which team?", {"billing": "Payments", "technical": "Bugs"})
+decider.noul("Please refund me.", "Does this message explicitly request a refund?")   # P(yes)
+decider.score("Site is down.", "How urgent is this?", ["routine", "elevated", "critical"])
+
+decider.decide(state, questions)   # JEV-style: {"answers": {question_id: ...}}
+```
+
+Each call has a batched form that packs every variant of every item into shared model batches and
+returns answers in input order:
+
+```python
+decider.choice_batch([{"context": c, "query": q, "choices": opts}, ...])
+decider.noul_batch([{"context": c, "query": q, "criteria": {"true": "...", "false": "..."}}, ...])
+decider.score_batch([{"context": c, "query": q, "levels": levels}, ...])
+decider.decide_batch([{"state": s, "questions": questions}, ...])
+```
+
+- `noul` is averaged over every yes/no wording used in training (yes/no, true/false, correct/incorrect,
+  affirmative/negative, supported/not supported, yes / true) in both orders.
+- `score` is probability-weighted over the levels (numeric keys are used as values, otherwise 0-based
+  indices) and averaged over the training label styles.
+- `choice` averages the original and reversed option order.
+- `confidence` is the top probability. Invalid questions raise `ValueError`.
+- Output shape differs from `JevBerta.predict_jev`: answers are keyed by question id under `answers`.
+
+To load either kind of checkpoint without knowing which it is, use `jev_berta.load(source)`; it returns a
+`JevDecider` when the config has `architecture` set to `hierarchical` or `bev`, and a `JevBerta` otherwise.
+
+On CUDA with fp16/bf16 and Triton installed, the hierarchical model uses a fused inference kernel and
+falls back to eager attention otherwise.
+
 ## Architecture
 
 The runtime package is centered on `JevBerta` in `src/jev_berta/jevberta.py`.
@@ -157,4 +199,4 @@ The package exposes two main inference calls:
 
 ## Demo Notebook
 
-See `demo/demo_usage.ipynb` for a runnable walkthrough that loads `leobitz/jev-berta-base-zeroshot-classifier` and demonstrates both APIs.
+See `demo/demo_usage.ipynb` for a runnable walkthrough that loads `leobitz/jev-berta-base-zeroshot-classifier` and demonstrates both APIs. See `demo/demo_decider.ipynb` for the same kind of walkthrough with `JevDecider`.
